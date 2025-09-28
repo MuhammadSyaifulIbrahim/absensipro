@@ -1,26 +1,33 @@
 // src/pages/SignIn.jsx
-import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
 import {
   signInWithGoogleSmart,
   getGoogleRedirectUser,
   ensureUserDoc,
+  onAuth,
 } from "../lib/firebase";
 
 export default function SignIn() {
   const nav = useNavigate();
+  const location = useLocation();
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
+  const handledRedirect = useRef(false); // hindari eksekusi ganda di React.StrictMode
 
-  // proses hasil redirect (kalau login pakai redirect)
+  // 1) Selesaikan hasil redirect (Safari/iOS atau env popup-blocked)
   useEffect(() => {
     (async () => {
+      if (handledRedirect.current) return;
+      handledRedirect.current = true;
       try {
         const user = await getGoogleRedirectUser();
         if (user) {
           setLoading(true);
           await ensureUserDoc(user);
-          nav("/dashboard");
+          const next =
+            new URLSearchParams(location.search).get("next") || "/dashboard";
+          nav(next, { replace: true });
         }
       } catch (e) {
         console.error(e);
@@ -29,21 +36,42 @@ export default function SignIn() {
         setLoading(false);
       }
     })();
-  }, [nav]);
+  }, [nav, location.search]);
+
+  // 2) Jika sudah login, langsung arahkan ke dashboard
+  useEffect(() => {
+    const unsub = onAuth((u) => {
+      if (u) {
+        const next =
+          new URLSearchParams(location.search).get("next") || "/dashboard";
+        nav(next, { replace: true });
+      }
+    });
+    return () => unsub();
+  }, [nav, location.search]);
 
   const go = async () => {
     setErr("");
     try {
       setLoading(true);
       const res = await signInWithGoogleSmart();
-      // Jika popup berhasil, res ada; kalau redirect, res = null (ditangani useEffect)
+      // Jika popup berhasil (non-Safari), res.user ada; kalau redirect, res = null (ditangani efek di atas).
       if (res?.user) {
         await ensureUserDoc(res.user);
-        nav("/dashboard");
+        const next =
+          new URLSearchParams(location.search).get("next") || "/dashboard";
+        nav(next, { replace: true });
       }
     } catch (e) {
       console.error(e);
-      setErr("Login gagal. Pastikan pakai akun Google kantor.");
+      // Pesan yang lebih informatif untuk kasus domain belum di-authorize
+      const msg =
+        (e?.code === "auth/unauthorized-domain" &&
+          "Domain belum diizinkan di Firebase Auth (Authorized domains).") ||
+        (e?.code === "auth/operation-not-allowed" &&
+          "Provider Google belum diaktifkan di Firebase Auth.") ||
+        "Login gagal. Pastikan pakai akun Google kantor.";
+      setErr(msg);
     } finally {
       setLoading(false);
     }
@@ -72,7 +100,6 @@ export default function SignIn() {
           {/* Logo/title */}
           <div className="mb-6 flex items-center justify-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-600/30">
-              {/* Minimal logo mark */}
               <svg
                 width="20"
                 height="20"
@@ -110,7 +137,7 @@ export default function SignIn() {
               className="group relative inline-flex w-full items-center justify-center gap-3 rounded-xl bg-slate-900 px-4 py-3 text-white shadow-lg shadow-slate-900/20 transition active:scale-[0.99] hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-70 dark:bg-white dark:text-slate-900 dark:shadow-white/10 dark:hover:bg-slate-100"
             >
               {/* Google icon */}
-              <span className="inline-flex h-5 w-5 items-center justify-center rounded-sm bg-white group-hover:scale-105 transition dark:bg-slate-900">
+              <span className="inline-flex h-5 w-5 items-center justify-center rounded-sm bg-white transition group-hover:scale-105 dark:bg-slate-900">
                 <svg viewBox="0 0 48 48" className="h-4 w-4">
                   <path
                     fill="#FFC107"

@@ -1,9 +1,12 @@
 // src/lib/firebase.js
 import { initializeApp, getApps, getApp } from "firebase/app";
 import {
+  initializeAuth,
   getAuth,
-  setPersistence,
+  indexedDBLocalPersistence,
   browserLocalPersistence,
+  browserSessionPersistence,
+  browserPopupRedirectResolver,
   GoogleAuthProvider,
   signInWithPopup,
   signInWithRedirect,
@@ -19,59 +22,84 @@ import {
   serverTimestamp,
 } from "firebase/firestore";
 
-// ------- config dari .env -------
+// ------- Config dari .env -------
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
   projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
   messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  // storageBucket opsional untuk proyek ini (pakai Cloudinary)
 };
 
-// ------- init aman HMR -------
-const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
-export const auth = getAuth(app);
-export const db = getFirestore(app);
+// ------- Init app (aman terhadap HMR) -------
+export const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 
-// persistence (opsional tapi disarankan)
+// ------- Auth: gunakan initializeAuth (agar bisa set persistence & resolver) -------
+let _auth;
 if (typeof window !== "undefined") {
-  setPersistence(auth, browserLocalPersistence).catch(() => {});
+  // Di browser: coba initializeAuth sekali.
+  try {
+    _auth = initializeAuth(app, {
+      persistence: [
+        // urutan fallback: IndexedDB -> LocalStorage -> SessionStorage
+        indexedDBLocalPersistence,
+        browserLocalPersistence,
+        browserSessionPersistence,
+      ],
+      popupRedirectResolver: browserPopupRedirectResolver,
+    });
+  } catch {
+    // Kalau sudah pernah di-init (HMR), ambil instance yang ada
+    _auth = getAuth(app);
+  }
+} else {
+  // Di SSR/Node (jika ada), cukup getAuth
+  _auth = getAuth(app);
 }
 
-// ------- provider Google -------
+export const auth = _auth;
+export const db = getFirestore(app);
+
+// ------- Provider Google -------
 const provider = new GoogleAuthProvider();
 provider.setCustomParameters({ prompt: "select_account" });
 
-// Jika halaman ter-isolasi (COOP/COEP) atau Safari, redirect lebih stabil
-const preferPopup = () => {
-  const ua = navigator.userAgent;
-  const isSafari = /^((?!chrome|android).)*safari/i.test(ua);
-  const isolated = !!window.crossOriginIsolated;
-  return !(isSafari || isolated);
-};
+// Login pintar: coba popup, fallback ke redirect jika popup tidak bisa
+export async function signInWithGoogleSmart() {
+  try {
+    return await signInWithPopup(auth, provider);
+  } catch (e) {
+    // Fallback yang umum di Safari / iOS / env yang memblokir popup
+    if (
+      e?.code === "auth/popup-blocked" ||
+      e?.code === "auth/popup-closed-by-user" ||
+      e?.code === "auth/operation-not-supported-in-this-environment" ||
+      e?.code === "auth/unauthorized-domain"
+    ) {
+      await signInWithRedirect(auth, provider);
+      return null; // hasil user akan diambil lewat getGoogleRedirectUser()
+    }
+    throw e;
+  }
+}
 
-// Login pintar: popup kalau bisa, redirect kalau perlu
-export const signInWithGoogleSmart = async () => {
-  if (preferPopup()) {
-    return signInWithPopup(auth, provider); // { user, ... }
-  } else {
-    await signInWithRedirect(auth, provider); // kembali ke halaman ini
+// Ambil hasil user setelah redirect (null kalau tidak ada)
+export async function getGoogleRedirectUser() {
+  try {
+    const res = await getRedirectResult(auth);
+    return res?.user ?? null;
+  } catch {
     return null;
   }
-};
+}
 
-// Ambil hasil setelah redirect (null kalau belum ada)
-export const getGoogleRedirectUser = async () => {
-  const res = await getRedirectResult(auth);
-  return res?.user || null;
-};
-
-// ----> INI YANG DIBUTUHKAN APP.JSX
+// Listener auth
 export const onAuth = (cb) => onAuthStateChanged(auth, cb);
 export const logOut = () => signOut(auth);
 
-// Buat dokumen users/{uid} pertama kali login
-export const ensureUserDoc = async (u) => {
+// Buat dokumen users/{uid} saat login pertama
+export async function ensureUserDoc(u) {
   if (!u) return;
   const ref = doc(db, "users", u.uid);
   const snap = await getDoc(ref);
@@ -80,9 +108,10 @@ export const ensureUserDoc = async (u) => {
       uid: u.uid,
       name: u.displayName,
       email: u.email,
-      role: "staff",
+      photoURL: u.photoURL ?? null,
+      role: "staff", // default
       active: true,
       createdAt: serverTimestamp(),
     });
   }
-};
+}
